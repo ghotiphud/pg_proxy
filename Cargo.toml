@@ -4,11 +4,15 @@ version = "0.1.0"
 authors = ["Yale Cason <yale.cason@gmail.com>"]
 
 [dependencies]
+error-chain = "0.7.1"
 log = "0.3"
 env_logger = "0.3"
-dotenv = "*"
+dotenv = "0.8"
 byteorder = "0.5"
 postgres-protocol = "0.1"
 futures = "0.1"
 tokio-core = "0.1.1"
 # tokio-service = { git = "https://github.com/tokio-rs/tokio-service" }
+
+#[replace]
+#"postgres-protocol:0.1.1" = { path = "rust-postgres-protocol" }

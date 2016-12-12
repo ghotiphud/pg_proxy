@@ -1,5 +1,14 @@
 //! An extensible Postgres Proxy Server based on tokio-core
-#![allow(unused_imports, unused_variables, unreachable_code)]
+#![allow(unused_imports, unused_variables, unreachable_code, dead_code)]
+
+// `error_chain!` can recurse deeply
+#![recursion_limit = "1024"]
+
+#[macro_use]
+extern crate error_chain;
+
+mod errors;
+use errors::*;
 
 #[macro_use]
 extern crate log;
@@ -14,13 +23,11 @@ extern crate tokio_core;
 extern crate byteorder;
 extern crate postgres_protocol;
 
-use byteorder::{ByteOrder, BigEndian};
 use dotenv::dotenv;
 
-// use std::rc::Rc;
 use std::env;
 use std::net::SocketAddr;
-use std::io::{Read, Write, Error};
+use std::io::{Read, Write};
 
 use futures::{Future, Poll, Async, BoxFuture};
 use futures::stream::Stream;
@@ -28,15 +35,38 @@ use tokio_core::io::{self, Io, ReadHalf, WriteHalf};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::reactor::{Core};
 
+// use postgres_protocol::message::{frontend, backend, ParseResult};
+// use postgres_protocol::message::backend::{Message};
 
-// use postgres_protocol::message::{frontend, backend};
-// use postgres_protocol::message::backend::{Message, ParseResult};
+use postgres_protocol::message::{frontend, backend};
+use postgres_protocol::message::backend::{Message, ParseResult};
+
+
+mod pg_parse;
+
+pub use pg_parse::{MessagePacket, MessageType};
 
 
 fn main() {
     env_logger::init().unwrap();
     dotenv().ok();
 
+    if let Err(ref e) = run() {
+        println!("error: {}", e);
+
+        for e in e.iter().skip(1) {
+            println!("caused by: {}", e);
+        }
+
+        if let Some(backtrace) = e.backtrace() {
+            println!("backtrace: {:?}", backtrace);
+        }
+
+        ::std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     // address that the proxy will bind to
     let bind_addr = env::args().nth(1).unwrap_or("127.0.0.1:5433".to_string());
     let bind_addr = bind_addr.parse::<SocketAddr>().unwrap();
@@ -57,10 +87,11 @@ fn main() {
     let proxy = listener.incoming().for_each(move |(client_stream, addr)| {
         debug!("Client Stream Opened");
         // create a Postgres connection to serve requests
-        let amts = TcpStream::connect(&postgres_addr, &handle).and_then(move |pg_stream| {
-            debug!("Postgres Stream Opened");
-            Pipe::new(client_stream, pg_stream)
-        });
+        let amts = TcpStream::connect(&postgres_addr, &handle)
+            .and_then(move |pg_stream| {
+                debug!("Postgres Stream Opened");
+                Pipe::new(client_stream, pg_stream)
+            });
 
         let future = amts
             // .map(move |(pg_amt, client_amt)| {
@@ -83,7 +114,11 @@ fn main() {
     });
 
     l.run(proxy).unwrap();
+
+    Ok(())
 }
+
+
 
 // /// Handlers return a variant of this enum to indicate how the proxy should handle the packet.
 // pub enum Action {
@@ -104,105 +139,6 @@ fn main() {
 //     fn handle_response(&mut self, m: &Message) -> Action;
 // }
 
-/// An enum representing Postgres backend message types
-#[derive(Debug, PartialEq)]
-pub enum MessageType {
-    Startup,
-    SSLRequest,
-    Authentication,
-    BackendKeyData,
-    BindComplete,
-    CloseComplete,
-    CommandComplete,
-    CopyData,
-    CopyDone,
-    CopyInResponse,
-    CopyOutResponse,
-    DataRow,
-    EmptyQueryResponse,
-    ErrorResponse,
-    NoData,
-    NoticeResponse,
-    NotificationResponse,
-    ParameterDescription,
-    ParameterStatus,
-    ParseComplete,
-    PasswordMessage,
-    PortalSuspended,
-    ReadyForQuery,
-    RowDescription,
-    Terminate,
-    Query,
-    #[doc(hidden)]
-    __ForExtensibility,
-}
-
-impl MessageType {
-    pub fn get_type(buf: &[u8]) -> Option<(Self, usize)> {
-        if buf.len() < 5 {
-            return None;
-        }
-
-        let tag = buf[0];
-        let len = BigEndian::read_u32(&buf[0..4]) as usize;
-
-        debug!("tag: {}", tag as char);
-
-        let msg_type = match tag {
-            b'1' => MessageType::ParseComplete,
-            b'2' => MessageType::BindComplete,
-            b'3' => MessageType::CloseComplete,
-            b'A' => MessageType::NotificationResponse,
-            b'c' => MessageType::CopyDone,
-            b'C' => MessageType::CommandComplete,
-            b'd' => MessageType::CopyData,
-            b'D' => MessageType::DataRow,
-            b'E' => MessageType::ErrorResponse,
-            b'G' => MessageType::CopyInResponse,
-            b'H' => MessageType::CopyOutResponse,
-            b'I' => MessageType::EmptyQueryResponse,
-            b'K' => MessageType::BackendKeyData,
-            b'n' => MessageType::NoData,
-            b'N' => MessageType::NoticeResponse,
-            b'R' => MessageType::Authentication,
-            b's' => MessageType::PortalSuspended,
-            b'S' => MessageType::ParameterStatus,
-            b't' => MessageType::ParameterDescription,
-            b'p' => MessageType::PasswordMessage,
-            b'T' => MessageType::RowDescription,
-            b'Z' => MessageType::ReadyForQuery,
-            b'Q' => MessageType::Query,
-            b'X' => MessageType::Terminate,
-            tag => {
-                let mt = if len == 8 {
-                    unimplemented!();
-                    MessageType::SSLRequest
-                } else {
-                    MessageType::Startup
-                };
-
-                debug!("Type: {:?}, {:?}, {:?}", mt, len, buf.len());
-
-                return Some((mt, len));
-                //return None;
-                // return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                //                           format!("unknown message tag `{}`", tag)));
-            }
-        };
-
-        // 
-        let len = BigEndian::read_u32(&buf[1..5]) as usize + 1;
-
-        debug!("Type: {:?}, {:?}, {:?}", msg_type, len, buf.len());
-
-        if len == buf.len() {
-            Some((msg_type, len))
-        } else {
-            None
-        }
-    }
-}
-
 pub struct MessageStream {
     reader: ReadHalf<TcpStream>,
     read_buf: Vec<u8>,
@@ -213,14 +149,14 @@ impl MessageStream {
     fn new(reader: ReadHalf<TcpStream>) -> Self {
         MessageStream {
             reader: reader,
-            read_buf: vec![0u8; 4096],
-            msg_buf: Vec::with_capacity(4096),
+            read_buf: vec![0u8; 8192],
+            msg_buf: Vec::with_capacity(8192),
         }
     }
 }
 
 impl Stream for MessageStream {
-    type Item = (MessageType, Vec<u8>);
+    type Item = MessagePacket;
     type Error = std::io::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
@@ -235,10 +171,7 @@ impl Stream for MessageStream {
                     // }
                     self.msg_buf.extend_from_slice(&self.read_buf[0..n]);
 
-                    if let Some((msg_type, len)) = MessageType::get_type(&self.msg_buf[..]){
-                        let msg_buf = self.msg_buf.drain(0..len).collect();
-                        let msg = (msg_type, msg_buf);
-
+                    if let Ok(msg) = MessagePacket::try_from(&mut self.msg_buf) {
                         return Ok(Async::Ready(Some(msg)));
                     }
                 },
@@ -260,18 +193,20 @@ impl Pipe {
         let (pg_reader, mut pg_writer) = pg_stream.split();
 
         let msg_stream = MessageStream::new(reader)
-            .for_each(move |(msg_type, msg_buf)| {
-                
-                if msg_type == MessageType::Query {
-                    //let msg = Message::parse(&msg_buf).unwrap();
+            .for_each(move |msg_pkt| {
+                match msg_pkt.msg_type {
+                    MessageType::Query => {
+                        // let msg = msg_pkt.to_message().ok();
 
-                    let query = std::ffi::CStr::from_bytes_with_nul(&msg_buf[5..]).unwrap()
+                        let query = std::ffi::CStr::from_bytes_with_nul(&msg_pkt.body[5..]).unwrap()
                         .to_str().unwrap();
 
-                    debug!("{}", query);
+                        debug!("{}", query);
+                    },
+                    _ => (),
                 }
 
-                let n = pg_writer.write(&msg_buf[..]);
+                msg_pkt.write(&mut pg_writer)?;
 
                 Ok(())
             });
@@ -288,7 +223,7 @@ impl Pipe {
 
 impl Future for Pipe {
     type Item = ();
-    type Error = Error;
+    type Error = std::io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.inner.poll()
